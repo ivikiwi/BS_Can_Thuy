@@ -1,13 +1,23 @@
 #include <stdio.h>
+#include <stdlib.h>
+
+#include <netdb.h>
+#include <netinet/in.h>
+
 #include <string.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
+#include <ctype.h>
+
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/wait.h>
 
 int put(char* key, char* value, char* res);
 int get(char* key, char* res);
 int del(char* key, char* res);
+int doproc(int sock);
+int getwords(char *line, char *words[], int maxwords);
 
 struct KeyPair {
 	char key[33];
@@ -16,23 +26,28 @@ struct KeyPair {
 
 struct KeyPair keys[10];
 const int NUM_KEYS = 1024;
-int mem_id;
+int id;
+int mem_id, *shar_mem;
+int pid[10];
 
 int main(int argc, char *argv[]) {
 	int mysocket , client_sock , c , read_size;
 	struct sockaddr_in server , client;
 	char client_message[2000];
+	int n, pid, ptr;
 
-	//methode um ein shared memory segment zu erstellen
- 	//mem_id = shmget(IPC_PRIVATE, sizeof(struct KeyPair) * NUM_KEYS, IPC_CREAT|0777);
+	//methode um ein shared memory segment zu erstellen - mit IPC_RIVATE erzeugt der UNIX-KERN den numerischen schlüssel selbst
+ 	mem_id = shmget(IPC_PRIVATE, sizeof(struct KeyPair) * 10, IPC_CREAT|0777);
 
  	//methode, um den inhalt des shared memory segments in die keys zu laden
-  	//keys = (struct KeyPair*)shmat(mem_id, 0, 0);
+  	shar_mem = (int *)shmat(mem_id, 0, 0);
+	*shar_mem = 0;
+  	//keys = shmat(mem_id, 0, 0);
 
   	//printf("Keys: %p\n", keys);
 
   	//fill the shared memory values with zero
-  	//memset(keys, 0, sizeof(struct KeyPair) * NUM_KEYS);
+  	//memset(keys, 0, sizeof(struct KeyPair) * 10);
 
 	mysocket = socket(AF_INET , SOCK_STREAM , 0);
 
@@ -64,14 +79,14 @@ int main(int argc, char *argv[]) {
 	puts("Warten auf eingehende connections...");
 	c = sizeof(struct sockaddr_in);
 
-	client_sock = accept(mysocket, (struct sockaddr *)&client, (socklen_t*)&c);
+	/*client_sock = accept(mysocket, (struct sockaddr *)&client, (socklen_t*)&c);
 	if (client_sock < 0) {
 		perror("accept failed");
 		return 1;
 	}
-	puts("Connection akzeptiert");
+	puts("Connection akzeptiert");*/
 
-	while( (read_size = recv(client_sock , client_message , 2000 , 0)) > 0) {
+	/*while( (read_size = recv(client_sock , client_message , 2000 , 0)) > 0) {
 		//write(client_sock , client_message , strlen(client_message));
 		char *buf = client_message;
 		int i = 0;
@@ -112,9 +127,123 @@ int main(int argc, char *argv[]) {
 	} else if(read_size == -1) {
 		perror("recv failed");
 	}
+	*/
+	//return 0;
 
-	return 0;
+	while (1) {
+	    client_sock = accept(mysocket, (struct sockaddr *)&client, (socklen_t*)&c);
+
+	    if (client_sock < 0) {
+	      perror("ERROR on accept");
+	      exit(1);
+	    }
+
+	    //create child process if needed
+	    pid = fork();
+
+	    // DEBUG: result = shmctl(id, cmd, buffer);
+
+	    if (pid < 0) {
+	      perror("ERROR on fork");
+	      exit(1);
+	    }
+
+	    //check if a new process was generated
+	    if (pid == 0) {
+	      //the process is kept alive until the client closes the connection
+	      while (doproc(client_sock) == 0) {}
+	      //closes the socket and basic clean up of the shared memory
+	      close(mysocket);
+	      shmdt(keys);
+	      shmctl(id, IPC_RMID, 0);
+	      exit(0);
+	    } else {
+	        close(client_sock);
+	    }
+	}
 }
+
+int doproc(int sock) {
+  int n;
+  char buffer[256];
+  bzero(buffer, 256);
+  n = read(sock,buffer,255);
+  char *words[sizeof(buffer)/2];
+  char res[256];
+
+  //divide buffer into array of words
+  int nwords = getwords(buffer, words, 10);
+
+  //errorhandling
+  if (n < 0) {
+    perror("ERROR reading from socket");
+    exit(1);
+  }
+
+  printf("Incomming: %s\n", buffer);
+
+  if (n < 0) {
+    perror("ERROR writing to socket");
+    exit(1);
+  }
+
+  //cancels the request by "EXIT"
+  if(strncmp(buffer, "EXIT", 4) == 0) {
+    return 1;
+  }
+
+  //handle user input
+  if (strncmp(words[0], "TST", 3) == 0){
+    printf("ERROR SUCCESS \n");
+  } else if(strncmp(words[0], "PUT", 3) == 0) {
+    put(words[1], words[2], res);
+  } else if(strncmp(words[0], "GET", 3) == 0) {
+    get(words[1], res);
+  } else if(strncmp(words[0], "DEL", 3) == 0) {
+    del(words[1], res);
+  }
+
+  //Output handling
+  char szOutput[256];
+  sprintf(szOutput, "Output: %s\n Id: %i\n", res, id);
+  n = write(sock, szOutput, strlen(szOutput)); //write answer to client
+
+  return 0;
+}
+
+int getwords (char *line, char *words[], int maxwords) {
+  char *p = line;
+  int nwords = 0;
+
+  while (1) {
+    while (isspace(*p)) {
+      p++;
+    }
+
+   /* if (*p == "\0") {
+      return nwords;
+    }*/
+      if(strcmp(p, "\0")) {
+      	return nwords;
+      }
+
+    words[nwords++] = p;
+
+    while (!isspace (*p) && *p != '\0') {
+      p++;
+    }
+    if (*p == '\0') {
+      return nwords;
+    }
+
+    *p++ = '\0';
+
+    if (nwords >= maxwords) {
+      return nwords;
+    }
+  }
+}
+
 
 int put(char* key, char* value, char* res) {
 	//printf("%lu\n", sizeof(keys)/sizeof(keys[0]));
